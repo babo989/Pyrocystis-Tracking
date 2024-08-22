@@ -1,0 +1,288 @@
+import sys
+
+sys.path.append('')
+
+from PyQt5.QtWidgets import QListWidget, QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget, QFileDialog, QLabel, QSlider, QMessageBox, QProgressBar, QDialog, QHBoxLayout, QScrollArea, QSizePolicy
+# Rest of the code
+from PyQt5.QtGui import QPixmap, QImage
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
+import cv2
+import numpy as np
+import os
+from ImageAnalysis import ImageAnalysis
+import GravityMachine.Analysis as Analysis
+import logging
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# Configure logging
+logging.basicConfig(filename='analysis.log', level=logging.INFO, 
+					format='%(asctime)s %(levelname)s: %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p')
+
+
+class AnalysisThread(QThread):
+	analysisFinished = pyqtSignal()
+	analysisFailed = pyqtSignal(str, str)
+	def __init__(self, dir_path, thresh, size_df):
+		super().__init__()
+		self.dir_path = dir_path
+		self.thresh = thresh
+		self.size_df = size_df
+	def run(self):
+		try:
+			# Set the track folder and track file paths
+			track_folder = self.dir_path
+			print(f"track_folder = {track_folder}")
+			track_file = 'track000.csv'
+	
+			# Perform the analysis on the current directory after finding the object size
+			gm_analysis = Analysis.GravityMachineTrack(track_folder=track_folder, track_file=track_file, Tmin=65, Tmax=125)
+			gm_analysis.compute_velocity()
+	#        gm_analysis.set_color_thresholds()
+			gm_analysis.build_image_dict()
+			gm_analysis.create_image_index()
+			gm_analysis.save_threshold(self.thresh)
+			gm_analysis.save_size_df(self.size_df)
+			gm_analysis.find_object_size()
+			image_a = '0000005.bmp'
+			image_b = '0000006.bmp'
+			
+			gm_analysis.initialize_piv_analysis()  # Initialize PIV folder
+			gm_analysis.compute_background_fluid_velocity(image_a, image_b, masking = True)
+			print('lol2')
+			gm_analysis.piv_settings['window size']= 128
+			gm_analysis.piv_settings['overlap']= 64
+			gm_analysis.piv_settings['search area']= 128
+			gm_analysis.piv_settings['scale-factor']= 1
+			gm_analysis.compute_background_fluid_velocity(image_a, image_b, masking = True)
+			gm_analysis.piv_settings
+			gm_analysis.compute_fluid_velocity_timeseries()
+			gm_analysis.compute_fluid_relative_disp(overwrite_flag = False, save = True)
+			print("Finished analyzing", track_folder)
+  
+			self.analysisFinished.emit()
+		except Exception as e:
+			error_message = f"Error analyzing {self.dir_path}: {e}"
+			print(error_message)
+			logging.error(error_message)  # Log the error
+			self.analysisFailed.emit(self.dir_path, str(e))
+class ProgressDialog(QDialog):
+	def __init__(self, parent=None):
+		super().__init__(parent)
+		self.setWindowTitle("Analyzing Directories...")
+		self.progress_label = QLabel("Analyzing directories...")
+		self.progress_bar = QProgressBar()
+		self.progress_bar.setMinimum(0)
+		self.progress_bar.setMaximum(100)
+		layout = QVBoxLayout()
+		layout.addWidget(self.progress_label)
+		layout.addWidget(self.progress_bar)
+		self.setLayout(layout)
+
+	def set_progress(self, value):
+		self.progress_bar.setValue(value)
+
+class MainWindow(QMainWindow):
+	
+	def __init__(self):
+		super().__init__()
+
+		self.central_widget = QWidget()
+		self.layout = QVBoxLayout()
+		self.central_widget.setLayout(self.layout)
+		self.image = None
+		self.scroll = QScrollArea()
+		self.scroll.setWidget(self.central_widget)
+		self.scroll.setWidgetResizable(True)
+		self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+		self.setCentralWidget(self.scroll)
+
+		self.thresh = None
+		self.size_df = None  # Initialize self.size_df to None
+		self.button_open = QPushButton('Open Image')
+		self.button_open.clicked.connect(self.open_image)
+		self.layout.addWidget(self.button_open)
+
+		self.button_save = QPushButton('Save threshold')
+		self.button_save.clicked.connect(self.save_threshold)
+		self.layout.addWidget(self.button_save)
+		
+		self.button_save_size = QPushButton('Size is OK')
+		self.button_save_size.clicked.connect(self.save_dimensions)
+		self.layout.addWidget(self.button_save_size)
+		
+		self.button_select_dirs = QPushButton('Select Directories')
+		self.button_select_dirs.clicked.connect(self.select_dirs)
+		self.layout.addWidget(self.button_select_dirs)
+		self.label_circled_image = QLabel()  # New QLabel for the image with the circled object
+		self.layout.addWidget(self.label_circled_image)
+
+		self.label_image = QLabel()
+		self.layout.addWidget(self.label_image)
+		self.setGeometry(100, 100, 800, 600)  # Set the fixed size of the window
+
+		self.slider_threshold = QSlider(Qt.Horizontal)
+		self.slider_threshold.setMinimum(0)
+		self.slider_threshold.setMaximum(255)
+		self.slider_threshold.valueChanged.connect(self.apply_threshold)
+		self.layout.addWidget(self.slider_threshold)
+
+		self.setCentralWidget(self.central_widget)
+
+		self.image_analysis = None
+		self.image = None
+		self.image_path = None
+		self.list_widget = QListWidget()
+		self.layout.addWidget(self.list_widget) 
+		self.button_analyze_all = QPushButton('Analyze All Directories')
+		self.button_analyze_all.clicked.connect(self.analyze_all_directories)
+		self.layout.addWidget(self.button_analyze_all)
+		self.label_image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+		self.label_circled_image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+		self.setGeometry(100, 100, 800, 600)
+
+
+		
+		self.label_selected_dirs = QLabel()
+		self.layout.addWidget(self.label_selected_dirs)
+		self.selected_dirs = []
+		
+	def analyze_all_directories(self):
+		if self.selected_dirs:
+			self.button_analyze_all.setEnabled(False)  # Disable the button during analysis
+			self.progress_dialog = ProgressDialog(self)
+			self.progress_dialog.set_progress(0)
+			self.progress_dialog.show()
+
+			self.analyze_threads = []
+
+			for dir_path in self.selected_dirs:
+				analyze_thread = AnalysisThread(dir_path, self.thresh, self.size_df)
+				analyze_thread.analysisFinished.connect(self.analysis_finished)
+				self.analyze_threads.append(analyze_thread)
+
+			self.current_thread = 0
+			self.analyze_threads[self.current_thread].start()
+
+			# Update the list widget w'0000097.bmp': '00000/0000097.bmp', '0000112.bmp': '00000/0000112.bmp', '0000066.bmp': '00000/0000066.bmp', '0000102.bmp':ith selected directories
+			self.list_widget.clear()
+			self.list_widget.addItems(self.selected_dirs)
+		else:
+			QMessageBox.warning(self, 'Analyze Directories', 'No directories selected.')
+
+
+	def analysis_finished(self):
+		self.current_thread += 1
+		progress = int((self.current_thread / len(self.selected_dirs)) * 100)
+		self.progress_dialog.set_progress(progress)
+
+		if self.current_thread < len(self.selected_dirs):
+			self.analyze_threads[self.current_thread].start()
+		else:
+			self.button_analyze_all.setEnabled(True)  # Re-enable the button
+			self.progress_dialog.close()
+
+		
+
+	def select_dirs(self):
+		options = QFileDialog.Options()
+		options |= QFileDialog.ReadOnly
+
+		while True:
+			dir_path = QFileDialog.getExistingDirectory(
+				self, 'Select Directories', '', options=options
+			)
+			if not dir_path:
+				break
+			self.selected_dirs.append(dir_path)
+
+	def analyze_directories(self, dirs):
+		for dir_path in dirs:
+			# Set the track folder and track file paths
+			track_folder = dir_path
+			track_file = 'track000.csv'
+	
+			# Perform the analysis on the current directory after finding the object size
+			gm_analysis = Analysis.GravityMachineTrack(track_folder=track_folder, track_file=track_file, Tmin=0, Tmax=360)
+			gm_analysis.create_image_index()
+			gm_analysis.set_color_thresholds()
+			gm_analysis.save_threshold(self.thresh)
+			gm_analysis.find_object_size(circle=True)
+			gm_analysis.compute_fluid_velocity_timeseries()
+			gm_analysis.compute_fluid_relative_disp(overwrite_flag=False, save=True)
+	
+			print("Finished analyzing", track_folder)
+
+
+	def open_image(self):
+		options = QFileDialog.Options()
+		options |= QFileDialog.ReadOnly
+		track_folder = QFileDialog.getExistingDirectory(self, 'Choose Track Folder', '', options=options)
+		if track_folder:
+			self.image_path, _ = QFileDialog.getOpenFileName(self, 'Open Image', '', 'Image Files (*.png *.jpg *.bmp *.jpeg)', options=options)
+			if self.image_path:
+				self.image = cv2.imread(self.image_path, cv2.IMREAD_GRAYSCALE)
+				self.image_analysis = ImageAnalysis(track_folder, self.image_path, 0.3)
+				self.display_image(self.image, self.label_image)
+
+	def apply_threshold(self):
+		if self.image_analysis is not None:
+			thresh = self.slider_threshold.value()
+			self.thresh = thresh  # Update the self.thresh value
+			thresh_img = self.image_analysis.apply_threshold(thresh)
+			self.display_image(thresh_img, self.label_image)
+
+	def save_threshold(self):
+		if self.image_analysis is not None:
+			thresh = self.slider_threshold.value()
+			self.image_analysis.set_color_thresholds()
+			self.image_analysis.save_threshold(thresh)  # Save the threshold value
+			circled_image = self.image_analysis.find_object_size(circle=True)  # Get the circled image
+			if circled_image is not None:
+				self.display_image(circled_image, self.label_circled_image)  # Display the circled image
+				self.size_df = self.image_analysis.size_df
+			else:
+				print("Error: Circled image is None")
+
+	def save_dimensions(self):
+		if self.image_analysis is not None:
+			if self.size_df is not None:
+				for dir_path in self.selected_dirs:
+					csv_path = os.path.join(dir_path, 'orgDims.csv')
+					self.size_df.to_csv(csv_path, index=False)
+				QMessageBox.information(self, 'Save Dimensions', 'Object dimensions saved successfully.')
+				self.analyze_directories(self.selected_dirs)
+			else:
+				QMessageBox.warning(self, 'Save Dimensions', 'Failed to calculate object dimensions.')
+		else:
+			QMessageBox.warning(self, 'Save Dimensions', 'Please open an image first.')
+
+
+	def display_image(self, img, label):
+		if len(img.shape) == 2:  # Grayscale image
+			q_img = QImage(img.data, img.shape[1], img.shape[0], QImage.Format_Grayscale8)
+		else:  # Color image
+			q_img = QImage(img.data, img.shape[1], img.shape[0], img.strides[0], QImage.Format_RGB888)
+	
+		pixmap = QPixmap.fromImage(q_img)
+	
+		# Calculate the aspect ratio of the image
+		aspect_ratio = img.shape[1] / img.shape[0]
+	
+		# Calculate the scaled dimensions based on the maximum width and height
+		scaled_width = min(label.width(), int(label.height() * aspect_ratio))
+		scaled_height = min(label.height(), int(label.width() / aspect_ratio))
+	
+		# Resize the pixmap to the scaled dimensions
+		scaled_pixmap = pixmap.scaled(scaled_width, scaled_height, Qt.KeepAspectRatio)
+	
+		label.setPixmap(scaled_pixmap)
+
+if __name__ == '__main__':
+	app = QApplication(sys.argv)
+	window = MainWindow()
+	window.show()
+	window.resize(400, 500)  # Set window size to 400x300 pixels
+	sys.exit(app.exec_())
