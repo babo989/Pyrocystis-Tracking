@@ -1,0 +1,126 @@
+import os
+import re
+from skimage import io, draw
+import pandas as pd
+import numpy as np
+from filterpy.kalman import KalmanFilter
+import matplotlib.pyplot as plt
+
+def initialize_kf():
+    kf = KalmanFilter(dim_x=4, dim_z=2)
+    kf.F = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]])  # State transition matrix
+    kf.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]])  # Measurement function
+    kf.P *= 1000  # Covariance matrix
+    kf.R *= 5  # Measurement noise
+    kf.Q *= 0.01  # Process noise
+    return kf
+
+def track_objects(folder_path, min_initial_area=500, min_range=50):
+    object_df = pd.DataFrame(columns=['object_id', 'frame', 'area', 'centroid_x', 'centroid_y', 'initial_area', 'area_diff', 'image', 'intensity', 'kf_x', 'kf_y'])
+    kfs = {}
+    object_id_counter = 1
+    object_last_seen = {}
+
+    files = os.listdir(folder_path)
+    png_files = [f for f in files if f.endswith(".png")]
+    sorted_files = sorted(png_files, key=lambda x: int(re.findall(r'frame_(\d+)_cp_masks', x)[0]))
+
+    for file in sorted_files:
+        image_path = os.path.join(folder_path, file)
+        image = io.imread(image_path)
+        frame = int(re.findall(r'frame_(\d+)_cp_masks', file)[0])
+        current_frame_objects = []
+
+        for label, obj_kf in kfs.items():
+            obj_kf.predict()
+
+        unique_intensities = np.unique(image[image > 0])  # Exclude background
+
+        for intensity in unique_intensities:
+            mask = image == intensity
+            area = np.sum(mask)
+            if area < min_initial_area:
+                continue
+
+            y, x = np.where(mask)
+            centroid_x, centroid_y = np.mean(x), np.mean(y)
+
+            # Match object with existing KFs
+            matched_object_id, min_distance = None, np.inf
+            for object_id, obj_kf in kfs.items():
+                distance = np.linalg.norm(obj_kf.x[:2] - np.array([centroid_x, centroid_y]))
+                if distance < min_distance and distance <= min_range:
+                    min_distance, matched_object_id = distance, object_id
+
+            if matched_object_id is None:
+                obj_kf = initialize_kf()
+                obj_kf.x = np.array([centroid_x, centroid_y, 0, 0])
+                matched_object_id = object_id_counter
+                kfs[matched_object_id] = obj_kf
+                object_last_seen[matched_object_id] = frame
+                object_id_counter += 1
+
+            kfs[matched_object_id].update([centroid_x, centroid_y])
+            current_frame_objects.append(matched_object_id)
+
+            # Calculate area difference if possible
+            initial_area = object_df.loc[object_df['object_id'] == matched_object_id, 'initial_area'].iloc[0] if matched_object_id in object_df['object_id'].values else area
+            area_diff = area - initial_area
+
+            new_row = pd.DataFrame({'object_id': [matched_object_id], 'frame': [frame], 'area': [area], 'centroid_x': [centroid_x], 'centroid_y': [centroid_y], 'initial_area': [initial_area], 'area_diff': [area_diff], 'image': [file], 'intensity': [intensity], 'kf_x': [centroid_x], 'kf_y': [centroid_y]}, index=[0])
+            object_df = pd.concat([object_df, new_row], ignore_index=True)
+
+        # Handle objects not seen in current frame
+        for object_id in set(object_last_seen.keys()) - set(current_frame_objects):
+            if object_last_seen[object_id] < frame - 1:  # Object was not seen in the previous frame as well
+                continue  # Skip adding a new row for objects that have been missing for more than one frame
+            new_row = pd.DataFrame({'object_id': [object_id], 'frame': [frame], 'area': [0], 'centroid_x': [np.nan], 'centroid_y': [np.nan], 'initial_area': [np.nan], 'area_diff': [0], 'image': [file], 'kf_x': [np.nan], 'kf_y': [np.nan]}, index=[0])
+            object_df = pd.concat([object_df, new_row], ignore_index=True)
+
+    return object_df
+
+def visualize_tracking(object_df, folder_path, output_folder, chosen_object_id):
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        
+    for frame in object_df['frame'].unique():
+        frame_data = object_df[(object_df['frame'] == frame) & (object_df['object_id'] == chosen_object_id)]
+        for index, row in frame_data.iterrows():
+            image_path = os.path.join(folder_path, row['image'])
+            image = io.imread(image_path)
+            if not np.isnan(row['centroid_x']) and not np.isnan(row['centroid_y']):
+                fig, ax = plt.subplots()
+                ax.imshow(image, cmap='gray')
+                rr, cc = draw.rectangle_perimeter(start=(int(row['centroid_y'] - 10), int(row['centroid_x'] - 10)), end=(int(row['centroid_y'] + 10), int(row['centroid_x'] + 10)))
+                image[rr, cc] = 255
+                ax.plot(row['centroid_x'], row['centroid_y'], 'ro')
+                ax.set_title(f"Frame {frame}, Object {row['object_id']}")
+                plt.savefig(os.path.join(output_folder, f"object_{row['object_id']}_frame_{frame}.png"))
+                plt.close()
+
+folder_path = ''
+output_folder = ''
+
+# Ensure the output folder exists
+if not os.path.exists(output_folder):
+    os.makedirs(output_folder)
+
+object_df = track_objects(folder_path, 500, 50)
+print(object_df.head())
+
+# Specify the ID of the object you want to track
+chosen_object_id = 30  # Adjust this to the ID of the object you're interested in
+
+# Visualization for the chosen object
+visualize_tracking(object_df, folder_path, output_folder, chosen_object_id)
+
+# Filter the original DataFrame for the chosen object
+chosen_object_df = object_df[object_df['object_id'] == chosen_object_id][['frame', 'area', 'area_diff']]
+
+# Define the path where you want to save the CSV file
+csv_output_path = os.path.join(output_folder, f"chosen_object_{chosen_object_id}_area_over_time.csv")
+
+# Save the filtered DataFrame as a CSV file
+chosen_object_df.to_csv(csv_output_path, index=False)
+
+print(f"CSV file saved at: {csv_output_path}")
